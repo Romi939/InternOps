@@ -7,8 +7,13 @@ const { toSchema } = require('../../utils/schemaHelper');
 const aiService = require('./ai.service');
 const rbac = require('../../middleware/rbac');
 const repo = require('./repository');
+const socialTasksRepo = require('../social-tasks/repository');
 const service = require('./service');
 const pLimit = require('p-limit');
+const { fetchProofContent } = require('../social-tasks/crawler.service');
+const { verifyClaim } = require('../social-tasks/ai-verify.service');
+const { checkHierarchyAccess } = require('../../utils/hierarchy');
+const verificationService = require('./verification.service');
 
 async function routes(fastify) {
   // Submit proof (intern only)
@@ -44,6 +49,157 @@ async function routes(fastify) {
           return reply.status(err.statusCode).send({ error: err.message });
         }
         throw err;
+      }
+    }
+  );
+
+  // Handler for reviewer "verify now" / ai-verify trigger
+  const handleTriggerVerification = async (req, reply) => {
+    try {
+      const proof = await repo.getProof(req.params.id);
+
+      if (!proof) {
+        return reply.status(404).send({
+          error: 'Proof not found',
+        });
+      }
+
+      if (req.user.id === proof.intern_id) {
+        return reply.status(403).send({
+          error: 'Forbidden: you cannot verify your own proof submission',
+        });
+      }
+
+      if (req.user.role !== 'ADMIN') {
+        const hasAccess = await checkHierarchyAccess(
+          req.user.id,
+          proof.intern_id
+        );
+
+        if (!hasAccess) {
+          return reply.status(403).send({
+            error: 'Forbidden: not in intern hierarchy',
+          });
+        }
+      }
+
+      const task = await socialTasksRepo.getTaskById(proof.task_id);
+
+      if (!task) {
+        return reply.status(404).send({
+          error: 'Task not found',
+        });
+      }
+
+      if (!task.task_link) {
+        return reply.status(400).send({
+          error: 'Task does not have a proof URL',
+        });
+      }
+
+      // Verification is intentionally asynchronous:
+      // The reviewer request must not wait for crawling or AI verification.
+      void verificationService.enqueueProofVerification(proof.id, {
+        reviewer: req.user,
+      });
+
+      return reply.status(202).send({
+        success: true,
+        proofId: proof.id,
+        status: 'verification_started',
+        advisory: true,
+      });
+    } catch (err) {
+      req.log.error(err, 'Failed to start AI verification: ' + req.params.id);
+
+      return reply.status(500).send({
+        error: 'AI verification failed to start',
+      });
+    }
+  };
+
+  // AI-verify a submitted proof against its task link (verify now)
+  fastify.post(
+    '/:id/ai-verify',
+    {
+      preHandler: [auth, rbac('CAPTAIN', 'TL', 'SENIOR_TL', 'ADMIN')],
+      schema: {
+        tags: ['Proofs'],
+        description: 'Start asynchronous AI verification for a proof',
+        params: toSchema(z.object({ id: z.string() })),
+      },
+    },
+    handleTriggerVerification
+  );
+
+  fastify.post(
+    '/:id/verify-now',
+    {
+      preHandler: [auth, rbac('CAPTAIN', 'TL', 'SENIOR_TL', 'ADMIN')],
+      schema: {
+        tags: ['Proofs'],
+        description: 'Reviewer trigger for asynchronous proof verification',
+        params: toSchema(z.object({ id: z.string() })),
+      },
+    },
+    handleTriggerVerification
+  );
+
+  // Get AI verification result for a proof
+  fastify.get(
+    '/:id/verification',
+    {
+      preHandler: [auth, rbac('CAPTAIN', 'TL', 'SENIOR_TL', 'ADMIN')],
+      schema: {
+        tags: ['Proofs'],
+        description: 'Get the AI verification result for a proof',
+        params: toSchema(z.object({ id: z.string() })),
+      },
+    },
+    async (req, reply) => {
+      try {
+        const proof = await repo.getProof(req.params.id);
+
+        if (!proof) {
+          return reply.status(404).send({ error: 'Proof not found' });
+        }
+
+        if (req.user.role !== 'ADMIN') {
+          const hasAccess = await checkHierarchyAccess(
+            req.user.id,
+            proof.intern_id
+          );
+
+          if (!hasAccess) {
+            return reply.status(403).send({
+              error: 'Forbidden: not in intern hierarchy',
+            });
+          }
+        }
+
+        const isPending = !proof.verification_result;
+        const isFailed = proof.verification_result?.status === 'failed';
+        const status = isPending
+          ? 'pending'
+          : isFailed
+            ? 'failed'
+            : 'completed';
+
+        return reply.send({
+          proofId: proof.id,
+          status,
+          verification: proof.verification_result || null,
+          advisory: true,
+        });
+      } catch (err) {
+        req.log.error(
+          err,
+          'Failed to get AI verification result: ' + req.params.id
+        );
+
+        return reply.status(500).send({
+          error: 'Failed to get verification result',
+        });
       }
     }
   );
@@ -102,7 +258,7 @@ async function routes(fastify) {
     },
     async (req, reply) => {
       try {
-        const task = await repo.getTaskById(req.params.taskId);
+        const task = await socialTasksRepo.getTaskById(req.params.taskId);
         if (!task) {
           return reply.status(404).send({ error: 'Task not found' });
         }
