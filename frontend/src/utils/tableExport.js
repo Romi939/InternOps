@@ -346,46 +346,46 @@ function drawPdfBrandHeader(doc, title, sectionLabel) {
   doc.text(`Generated ${new Date().toLocaleString()} | InternOps`, 30, 79);
 }
 
-function pdfColumnStyles(columns, isRatings) {
+function pdfColumnStyles(columns, isRatings, availableWidth) {
   const styles = {};
 
-  if (isRatings) {
-    const widths = [44, 155, 205, 125, 75, 105, 90, 335];
+  const baseWidths = isRatings
+    ? [44, 155, 205, 125, 75, 105, 90, 335]
+    : [42, 150, 205, 125, 75, 110];
 
-    columns.forEach((column, index) => {
-      styles[index] = {
-        cellWidth: widths[index] || 90,
-      };
+  const dynamicWidth = isRatings ? 120 : 61;
 
-      if (
-        column.key === '__serialNumber' ||
-        column.key === 'role' ||
-        column.key === 'status' ||
-        column.key.startsWith('rating')
-      ) {
-        styles[index].halign = 'center';
-      }
+  const rawWidths = columns.map((column, index) => {
+    if (index < baseWidths.length) {
+      return baseWidths[index];
+    }
 
-      if (column.key === '__serialNumber' || column.key === 'member') {
-        styles[index].fontStyle = 'bold';
-      }
-    });
+    if (column.key?.startsWith('reason')) {
+      return 220;
+    }
 
-    return styles;
-  }
+    if (column.key?.startsWith('rating')) {
+      return 110;
+    }
 
-  const attendanceWidths = [42, 150, 205, 125, 75, 110];
+    return dynamicWidth;
+  });
+
+  const totalWidth = rawWidths.reduce((sum, width) => sum + width, 0);
+
+  const scale = totalWidth > availableWidth ? availableWidth / totalWidth : 1;
 
   columns.forEach((column, index) => {
     styles[index] = {
-      cellWidth: index < attendanceWidths.length ? attendanceWidths[index] : 61,
+      cellWidth: Math.max(35, rawWidths[index] * scale),
     };
 
     if (
       column.key === '__serialNumber' ||
       column.key === 'role' ||
       column.key === 'status' ||
-      index >= PDF_IDENTITY_COLUMNS
+      index >= PDF_IDENTITY_COLUMNS ||
+      column.key?.startsWith('rating')
     ) {
       styles[index].halign = 'center';
     }
@@ -409,12 +409,18 @@ async function exportPdf({
     import('jspdf'),
     import('jspdf-autotable'),
   ]);
+
   const isRatings = String(sheetName).toLowerCase().includes('rating');
+
   const groups = splitPdfColumnGroups(columns, sheetName);
-  const pageWidth = 1190;
+
+  // Landscape A4 gives the table more horizontal space
+  const pageWidth = 841.89;
   const pageMargin = 28;
   const tableStartY = 92;
   const footerSpace = 46;
+
+  const availableTableWidth = pageWidth - pageMargin * 2;
 
   const createTableBody = (group) =>
     rows.map((row) =>
@@ -432,20 +438,24 @@ async function exportPdf({
 
     const value = data.cell.raw;
     const currentColumn = group[data.column.index];
+
     const isSerialNumber = currentColumn?.key === '__serialNumber';
 
     if (isSerialNumber) {
       data.cell.styles.fillColor =
         data.row.index % 2 === 0 ? [255, 255, 255] : [248, 250, 252];
+
       data.cell.styles.textColor = [51, 65, 85];
       data.cell.styles.fontStyle = 'bold';
       data.cell.styles.halign = 'center';
+
       return;
     }
 
     if (value === '' || value == null) {
       data.cell.styles.fillColor =
         data.row.index % 2 === 0 ? [255, 255, 255] : [248, 250, 252];
+
       return;
     }
 
@@ -472,47 +482,64 @@ async function exportPdf({
 
   const createTableOptions = (group) => ({
     startY: tableStartY,
+
     margin: {
       left: pageMargin,
       right: pageMargin,
       bottom: 18,
     },
-    pageBreak: 'avoid',
-    rowPageBreak: 'avoid',
-    showHead: 'firstPage',
+
+    pageBreak: 'auto',
+    rowPageBreak: 'auto',
+
+    showHead: 'everyPage',
+
     head: [group.map((column) => column.label)],
+
     body: createTableBody(group),
+
     theme: 'grid',
-    tableWidth: 1134,
+
+    tableWidth: availableTableWidth,
+
     styles: {
       font: 'helvetica',
-      fontSize: isRatings ? 8 : 8.5,
-      cellPadding: isRatings ? 5 : 4,
+      fontSize: isRatings ? 7.5 : 8,
+      cellPadding: isRatings ? 4 : 3.5,
       overflow: 'linebreak',
       valign: 'middle',
       lineColor: [203, 213, 225],
       lineWidth: 0.45,
       textColor: [51, 65, 85],
     },
+
     headStyles: {
       fillColor: [23, 32, 51],
       textColor: [255, 255, 255],
       fontStyle: 'bold',
       halign: 'center',
-      minCellHeight: 30,
+      valign: 'middle',
+      minCellHeight: 28,
     },
+
     alternateRowStyles: {
       fillColor: [248, 250, 252],
     },
-    columnStyles: pdfColumnStyles(group, isRatings),
+
+    columnStyles: pdfColumnStyles(group, isRatings, availableTableWidth),
+
     didParseCell: (data) => applyCellStyle(group, data),
   });
 
+  /*
+   * First create a large temporary document to measure
+   * the complete table height.
+   */
   const measuredGroups = groups.map((group) => {
-    const measurementHeight = Math.max(3000, 250 + rows.length * 90);
+    const measurementHeight = Math.max(3000, 250 + rows.length * 70);
 
     const measurementDocument = new jsPDF({
-      orientation: 'portrait',
+      orientation: 'landscape',
       unit: 'pt',
       format: [pageWidth, measurementHeight],
     });
@@ -531,14 +558,14 @@ async function exportPdf({
   const firstPageHeight = measuredGroups[0]?.pageHeight || 842;
 
   const doc = new jsPDF({
-    orientation: 'portrait',
+    orientation: 'landscape',
     unit: 'pt',
     format: [pageWidth, firstPageHeight],
   });
 
   measuredGroups.forEach(({ group, pageHeight }, groupIndex) => {
     if (groupIndex > 0) {
-      doc.addPage([pageWidth, pageHeight], 'portrait');
+      doc.addPage([pageWidth, pageHeight], 'landscape');
     }
 
     const dynamicLabels = group
@@ -567,10 +594,13 @@ async function exportPdf({
     const footerTextY = pageHeight - 12;
 
     doc.setDrawColor(226, 232, 240);
+
     doc.line(pageMargin, footerLineY, pageWidth - pageMargin, footerLineY);
 
     doc.setFont('helvetica', 'normal');
+
     doc.setFontSize(8);
+
     doc.setTextColor(100, 116, 139);
 
     doc.text('InternOps generated report', pageMargin, footerTextY);
@@ -584,7 +614,6 @@ async function exportPdf({
 
   doc.save(`${fileBase}.pdf`);
 }
-
 export async function exportTable(options) {
   const { format, title, fileBase, columns, rows } = options;
 
